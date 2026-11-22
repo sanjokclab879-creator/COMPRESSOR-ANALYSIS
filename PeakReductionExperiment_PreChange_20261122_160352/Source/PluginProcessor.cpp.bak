@@ -1,0 +1,668 @@
+﻿#include "PluginProcessor.h"
+#include <cmath>
+#include <algorithm>
+
+namespace
+{
+    constexpr float referenceGain = 0.321869f;
+    constexpr float referenceMakeupDb = 5.617f;
+
+    constexpr std::array<float, 6> inputLevelsDb
+    {
+        -36.0f, -30.0f, -24.0f, -18.0f, -12.0f, -6.0f
+    };
+
+    constexpr std::array<float, 5> peakReductionLevels
+    {
+        0.14f, 0.277466f, 0.50f, 0.68f, 0.86f
+    };
+
+    // Измеренная относительная компрессия в dB.
+    // Строки соответствуют значениям Peak Reduction.
+    constexpr float compressionCurve[5][6] =
+    {
+        { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.020f },
+        { 0.0f, 0.0f, 0.001f, 0.009f, 0.210f, 3.029f },
+        { 0.0f, 0.0f, 0.157f, 2.985f, 7.439f, 12.259f },
+        { 0.0f, 1.971f, 6.223f, 10.998f, 15.868f, 20.646f },
+        { 0.0f, 4.738f, 9.605f, 14.429f, 19.028f, 23.376f }
+    };
+
+    // Attack 63%: PR 25, 50, 75, 90.
+    // Входные уровни: -9, -6, -3, 0 dB.
+    constexpr float attackPeakReduction[4] =
+    {
+        0.277466f, 0.50f, 0.68f, 0.86f
+    };
+
+    constexpr float attackInputLevels[4] =
+    {
+        -9.0f, -6.0f, -3.0f, 0.0f
+    };
+
+    constexpr float attackTimesMs[4][4] =
+    {
+        { 82.0f, 33.0f, 13.0f, 7.0f },
+        { 4.0f, 4.0f, 4.0f, 3.0f },
+        { 3.0f, 3.0f, 3.0f, 4.0f },
+        { 4.0f, 4.0f, 5.0f, 5.0f }
+    };
+
+    // Средние измеренные времена Release 63%.
+    constexpr float releaseTimesMs[4] =
+    {
+        600.0f, 375.0f, 295.0f, 145.0f
+    };
+
+    float interpolate(
+        float x,
+        float x0,
+        float x1,
+        float y0,
+        float y1)
+    {
+        if (std::abs(x1 - x0) < 0.000001f)
+            return y0;
+
+        const float t = juce::jlimit(
+            0.0f, 1.0f, (x - x0) / (x1 - x0));
+
+        return y0 + t * (y1 - y0);
+    }
+
+    float interpolateCompression(
+        float inputDb,
+        float peakReduction)
+    {
+        inputDb = juce::jmax(-36.0f, inputDb);
+
+        int inputIndex = 0;
+
+        while (inputIndex < 4 &&
+               inputDb > inputLevelsDb[inputIndex + 1])
+        {
+            ++inputIndex;
+        }
+
+        const float inputValue =
+            (inputDb - inputLevelsDb[inputIndex])
+            / (inputLevelsDb[inputIndex + 1]
+            - inputLevelsDb[inputIndex]);
+
+        peakReduction = juce::jlimit(
+            peakReductionLevels[0],
+            peakReductionLevels[4],
+            peakReduction);
+
+        int prIndex = 0;
+
+        while (prIndex < 3 &&
+               peakReduction > peakReductionLevels[prIndex + 1])
+        {
+            ++prIndex;
+        }
+
+        const float lowValue =
+            compressionCurve[prIndex][inputIndex]
+            + inputValue *
+            (compressionCurve[prIndex][inputIndex + 1]
+            - compressionCurve[prIndex][inputIndex]);
+
+        const float highValue =
+            compressionCurve[prIndex + 1][inputIndex]
+            + inputValue *
+            (compressionCurve[prIndex + 1][inputIndex + 1]
+            - compressionCurve[prIndex + 1][inputIndex]);
+
+        return interpolate(
+            peakReduction,
+            peakReductionLevels[prIndex],
+            peakReductionLevels[prIndex + 1],
+            lowValue,
+            highValue);
+    }
+
+    float getAttackTimeMs(
+        float peakReduction,
+        float inputDb)
+    {
+        inputDb = juce::jlimit(-9.0f, 0.0f, inputDb);
+
+        int inputIndex = 0;
+
+        while (inputIndex < 2 &&
+               inputDb > attackInputLevels[inputIndex + 1])
+        {
+            ++inputIndex;
+        }
+
+        float values[4];
+
+        for (int i = 0; i < 4; ++i)
+        {
+            values[i] = interpolate(
+                inputDb,
+                attackInputLevels[inputIndex],
+                attackInputLevels[inputIndex + 1],
+                attackTimesMs[i][inputIndex],
+                attackTimesMs[i][inputIndex + 1]);
+        }
+
+        int prIndex = 0;
+
+        while (prIndex < 2 &&
+               peakReduction > attackPeakReduction[prIndex + 1])
+        {
+            ++prIndex;
+        }
+
+        return interpolate(
+            peakReduction,
+            attackPeakReduction[prIndex],
+            attackPeakReduction[prIndex + 1],
+            values[prIndex],
+            values[prIndex + 1]);
+    }
+
+    float getReleaseTimeMs(float peakReduction)
+    {
+        peakReduction = juce::jlimit(
+            attackPeakReduction[0],
+            attackPeakReduction[3],
+            peakReduction);
+
+        int index = 0;
+
+        while (index < 2 &&
+               peakReduction > attackPeakReduction[index + 1])
+        {
+            ++index;
+        }
+
+        return interpolate(
+            peakReduction,
+            attackPeakReduction[index],
+            attackPeakReduction[index + 1],
+            releaseTimesMs[index],
+            releaseTimesMs[index + 1]);
+    }
+}
+
+//============================================================
+// Parameter layout
+//============================================================
+
+juce::AudioProcessorValueTreeState::ParameterLayout
+OptoTubeLA2AAudioProcessor::createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    layout.add(
+        std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID { "gain", 1 },
+            "Gain",
+            juce::NormalisableRange<float>(
+                0.05f, 0.95f, 0.0001f),
+            referenceGain));
+
+    layout.add(
+        std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID { "peakReduction", 1 },
+            "Peak Reduction",
+            juce::NormalisableRange<float>(
+                0.0f, 1.0f, 0.0001f),
+            0.277466f));
+
+    layout.add(
+        std::make_unique<juce::AudioParameterBool>(
+            juce::ParameterID { "bypass", 1 },
+            "Bypass",
+            false));
+
+    return layout;
+}
+
+//============================================================
+// Constructor
+//============================================================
+
+OptoTubeLA2AAudioProcessor::OptoTubeLA2AAudioProcessor()
+    : AudioProcessor(
+        BusesProperties()
+            .withInput(
+                "Input",
+                juce::AudioChannelSet::stereo(),
+                true)
+            .withOutput(
+                "Output",
+                juce::AudioChannelSet::stereo(),
+                true)),
+      parameters(
+          *this,
+          nullptr,
+          "PARAMETERS",
+          createParameterLayout())
+{
+    updateParameters();
+}
+
+//============================================================
+// Prepare
+//============================================================
+
+void OptoTubeLA2AAudioProcessor::prepareToPlay(
+    double sampleRate,
+    int samplesPerBlock)
+{
+    juce::ignoreUnused(samplesPerBlock);
+
+    currentSampleRate = sampleRate;
+
+    for (auto& state : channelStates)
+        state = ChannelState {};
+
+    updateParameters();
+    updateTimeCoefficients();
+}
+
+void OptoTubeLA2AAudioProcessor::releaseResources()
+{
+    for (auto& state : channelStates)
+        state = ChannelState {};
+}
+
+//============================================================
+// Bus layout
+//============================================================
+
+bool OptoTubeLA2AAudioProcessor::isBusesLayoutSupported(
+    const BusesLayout& layouts) const
+{
+    const auto input = layouts.getMainInputChannelSet();
+    const auto output = layouts.getMainOutputChannelSet();
+
+    if (input != output)
+        return false;
+
+    return input == juce::AudioChannelSet::mono()
+        || input == juce::AudioChannelSet::stereo();
+}
+
+//============================================================
+// Parameter update
+//============================================================
+
+void OptoTubeLA2AAudioProcessor::updateParameters()
+{
+    currentGain =
+        parameters.getRawParameterValue("gain")->load();
+
+    currentPeakReduction =
+        parameters.getRawParameterValue("peakReduction")->load();
+
+    updateTimeCoefficients();
+}
+
+//============================================================
+// Time coefficients
+//============================================================
+
+void OptoTubeLA2AAudioProcessor::updateTimeCoefficients()
+{
+    const float releaseMs =
+        getReleaseTimeMs(currentPeakReduction);
+
+    releaseFastCoefficient = static_cast<float>(
+        std::exp(-1.0 /
+            (0.001 * releaseMs * currentSampleRate)));
+
+    // Резерв для последующей калибровки двухскоростного
+    // оптического восстановления по FastTau / SlowTau.
+    releaseSlowCoefficient = releaseFastCoefficient;
+
+    attackCoefficient = 0.0f;
+}
+
+//============================================================
+// Detector
+//============================================================
+
+float OptoTubeLA2AAudioProcessor::processDetector(
+    float input,
+    ChannelState& state)
+{
+    juce::ignoreUnused(state);
+
+    return std::abs(input);
+}
+
+//============================================================
+// Optical cell
+//============================================================
+
+float OptoTubeLA2AAudioProcessor::processOpticalCell(
+    float detectorLevel,
+    ChannelState& state)
+{
+    state.detectorEnvelope = detectorLevel;
+
+    // Для определения времени Attack используем состояние
+    // оптической ячейки, а не мгновенное значение входной волны.
+    // При первом сэмпле используем входной уровень.
+    const float timingLevel =
+        state.opticalEnvelope > 0.000001f
+        ? state.opticalEnvelope
+        : detectorLevel;
+
+    const float levelDb = 20.0f * std::log10(
+        juce::jmax(timingLevel, 0.000001f));
+
+    const float attackMs = getAttackTimeMs(
+        currentPeakReduction,
+        levelDb);
+
+    const float attackCoeff = static_cast<float>(
+        std::exp(-1.0 /
+            (0.001 * attackMs * currentSampleRate)));
+
+    if (detectorLevel > state.opticalEnvelope)
+    {
+        state.opticalEnvelope =
+            attackCoeff * state.opticalEnvelope
+            + (1.0f - attackCoeff) * detectorLevel;
+    }
+    else
+    {
+        state.opticalEnvelope =
+            releaseFastCoefficient * state.opticalEnvelope
+            + (1.0f - releaseFastCoefficient) * detectorLevel;
+    }
+
+    return state.opticalEnvelope;
+}
+
+//============================================================
+// Compression gain
+//============================================================
+
+float OptoTubeLA2AAudioProcessor::calculateCompressionGain(
+    float detectorLevel,
+    float peakReduction,
+    bool isLimitMode)
+{
+    juce::ignoreUnused(isLimitMode);
+
+    if (detectorLevel <= 0.0f)
+        return 1.0f;
+
+    const float inputDb = 20.0f * std::log10(
+        juce::jmax(detectorLevel, 0.000001f));
+
+    const float reductionDb = interpolateCompression(
+        inputDb,
+        peakReduction);
+
+    return juce::Decibels::decibelsToGain(-reductionDb);
+}
+
+//============================================================
+// Tube nonlinearity
+//============================================================
+
+float OptoTubeLA2AAudioProcessor::processTubeNonlinearity(
+    float input,
+    ChannelState& state,
+    float gain)
+{
+    juce::ignoreUnused(state, gain);
+
+    // Здесь будет отдельная гармоническая модель,
+    // калиброванная по измерениям UADx LA-2A:
+    // THD, H2-H10, Gain и Peak Reduction.
+    //
+    // Пока оставляем сигнал линейным.
+    // Не используем произвольный hard clipper.
+
+    return input;
+}
+
+//============================================================
+// Single sample
+//============================================================
+
+float OptoTubeLA2AAudioProcessor::processSample(
+    float input,
+    ChannelState& state)
+{
+    const float detector = processDetector(input, state);
+
+    const float envelope = processOpticalCell(
+        detector,
+        state);
+
+    const float compressionGain = calculateCompressionGain(
+        envelope,
+        currentPeakReduction,
+        limitMode);
+
+    const float makeupDb =
+        referenceMakeupDb
+        + 20.0f * std::log10(
+            juce::jmax(currentGain, 0.000001f) / referenceGain);
+
+    const float makeupGain =
+        juce::Decibels::decibelsToGain(makeupDb);
+
+    const float compressed = input * compressionGain;
+
+    const float saturated = processTubeNonlinearity(
+        compressed,
+        state,
+        currentGain);
+
+    return saturated * makeupGain;
+}
+
+//============================================================
+// Audio processing
+//============================================================
+
+void OptoTubeLA2AAudioProcessor::processBlock(
+    juce::AudioBuffer<float>& buffer,
+    juce::MidiBuffer& midiMessages)
+{
+    juce::ignoreUnused(midiMessages);
+
+    juce::ScopedNoDenormals noDenormals;
+
+    updateParameters();
+
+    const bool bypass =
+        parameters.getRawParameterValue("bypass")->load() > 0.5f;
+
+    if (bypass)
+        return;
+
+    const int numChannels = juce::jmin(
+        buffer.getNumChannels(), 2);
+
+    const int numSamples = buffer.getNumSamples();
+
+    const float makeupDb =
+        referenceMakeupDb
+        + 20.0f * std::log10(
+            juce::jmax(currentGain, 0.000001f) / referenceGain);
+
+    const float makeupGain =
+        juce::Decibels::decibelsToGain(makeupDb);
+
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        float linkedDetector = 0.0f;
+
+        for (int channel = 0; channel < numChannels; ++channel)
+        {
+            linkedDetector = juce::jmax(
+                linkedDetector,
+                processDetector(
+                    buffer.getSample(channel, sample),
+                    channelStates[static_cast<size_t>(channel)]));
+        }
+
+        for (int channel = 0; channel < numChannels; ++channel)
+        {
+            auto& state =
+                channelStates[static_cast<size_t>(channel)];
+
+            const float envelope = processOpticalCell(
+                linkedDetector,
+                state);
+
+            const float compressionGain =
+                calculateCompressionGain(
+                    envelope,
+                    currentPeakReduction,
+                    limitMode);
+
+            const float input = buffer.getSample(channel, sample);
+
+            const float compressed =
+                input * compressionGain;
+
+            const float nonlinear = processTubeNonlinearity(
+                compressed,
+                state,
+                currentGain);
+
+            const float output = nonlinear * makeupGain;
+
+            buffer.setSample(channel, sample, output);
+        }
+    }
+
+    for (int channel = numChannels;
+         channel < buffer.getNumChannels();
+         ++channel)
+    {
+        buffer.clear(channel, 0, numSamples);
+    }
+}
+
+//============================================================
+// Editor
+//============================================================
+
+juce::AudioProcessorEditor*
+OptoTubeLA2AAudioProcessor::createEditor()
+{
+    return new juce::GenericAudioProcessorEditor(*this);
+}
+
+bool OptoTubeLA2AAudioProcessor::hasEditor() const
+{
+    return true;
+}
+
+//============================================================
+// Plugin information
+//============================================================
+
+const juce::String
+OptoTubeLA2AAudioProcessor::getName() const
+{
+    return "OptoTube LA-2A Silver";
+}
+
+bool OptoTubeLA2AAudioProcessor::acceptsMidi() const
+{
+    return false;
+}
+
+bool OptoTubeLA2AAudioProcessor::producesMidi() const
+{
+    return false;
+}
+
+bool OptoTubeLA2AAudioProcessor::isMidiEffect() const
+{
+    return false;
+}
+
+double OptoTubeLA2AAudioProcessor::getTailLengthSeconds() const
+{
+    return 5.0;
+}
+
+int OptoTubeLA2AAudioProcessor::getNumPrograms()
+{
+    return 1;
+}
+
+int OptoTubeLA2AAudioProcessor::getCurrentProgram()
+{
+    return 0;
+}
+
+void OptoTubeLA2AAudioProcessor::setCurrentProgram(int index)
+{
+    juce::ignoreUnused(index);
+}
+
+const juce::String
+OptoTubeLA2AAudioProcessor::getProgramName(int index)
+{
+    juce::ignoreUnused(index);
+    return {};
+}
+
+void OptoTubeLA2AAudioProcessor::changeProgramName(
+    int index,
+    const juce::String& newName)
+{
+    juce::ignoreUnused(index, newName);
+}
+
+//============================================================
+// State
+//============================================================
+
+void OptoTubeLA2AAudioProcessor::getStateInformation(
+    juce::MemoryBlock& destData)
+{
+    auto state = parameters.copyState();
+
+    std::unique_ptr<juce::XmlElement> xml(
+        state.createXml());
+
+    copyXmlToBinary(*xml, destData);
+}
+
+void OptoTubeLA2AAudioProcessor::setStateInformation(
+    const void* data,
+    int sizeInBytes)
+{
+    std::unique_ptr<juce::XmlElement> xml(
+        getXmlFromBinary(data, sizeInBytes));
+
+    if (xml != nullptr &&
+        xml->hasTagName(parameters.state.getType()))
+    {
+        parameters.replaceState(
+            juce::ValueTree::fromXml(*xml));
+
+        updateParameters();
+    }
+}
+
+//============================================================
+// Plugin factory
+//============================================================
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new OptoTubeLA2AAudioProcessor();
+}
+
+
+
+
